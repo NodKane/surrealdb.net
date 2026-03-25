@@ -4,6 +4,8 @@
         <IsTestProject>true</IsTestProject>
         <OutputType>Exe</OutputType>
         <TargetFramework>net10.0</TargetFramework>
+        <TestingPlatformDotnetTestSupport>true</TestingPlatformDotnetTestSupport>
+        <TestingPlatformServerMode>true</TestingPlatformServerMode>
     </PropertyGroup>
 
     <ItemGroup>
