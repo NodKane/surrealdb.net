@@ -99,7 +99,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           sparse-checkout: |
             rust-embedded
@@ -109,7 +109,7 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
 
       - name: Setup Android NDK
-        uses: nttld/setup-ndk@v1
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
         id: setup-ndk
         with:
           ndk-version: r26d
@@ -137,7 +137,7 @@ jobs:
         if: matrix.target == 'aarch64-apple-ios'
 
       - name: Install 1.91.0 toolchain
-        uses: dtolnay/rust-toolchain@1.91.0
+        uses: dtolnay/rust-toolchain@0dd4a6d07aedb0ef7f65e79f3e229a6c102ae2e0 # 1.91.0
         with:
           toolchain: 1.91.0 # must match the version in the `rust-embedded/rust-toolchain` file
           target: ${{ matrix.target }}
@@ -155,21 +155,22 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Publish embedded artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: embedded-${{ matrix.target }}
           path: ${{ matrix.libpath }}
 
   create-package:
-    needs: ${{ github.event_name == 'release' && fromJSON('["embedded-builds"]') || fromJSON('[]') }}
+    needs: [embedded-builds]
+    if: always()
     runs-on: ubuntu-latest-4-cores
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Download embedded artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         if: github.event_name == 'release'
         with:
           pattern: embedded-*
@@ -184,7 +185,7 @@ jobs:
           echo "VERSION_SUFFIX=pr${PR_NUMBER}-${TIMESTAMP}" >> $GITHUB_ENV
 
       - name: Setup dotnet 10.0
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7 # v5
         with:
           dotnet-version: "10.0.x"
 
@@ -200,7 +201,7 @@ jobs:
         if: github.event_name == 'pull_request'
         run: dotnet pack /p:GenerateCompatibilitySuppressionFile=true --configuration Release --output ${{ env.NuGetDirectory }} --version-suffix "${{ env.VERSION_SUFFIX }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nuget
           if-no-files-found: error
@@ -209,15 +210,16 @@ jobs:
 
   validate-package:
     needs: [create-package]
+    if: always() && needs.create-package.result == 'success'
     runs-on: ubuntu-latest-4-cores
 
     steps:
       - name: Setup dotnet 10.0
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7 # v5
         with:
           dotnet-version: "10.0.x"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: nuget
           path: ${{ env.NuGetDirectory }}
@@ -235,11 +237,11 @@ jobs:
 
     steps:
       - name: Setup dotnet 10.0
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7 # v5
         with:
           dotnet-version: "10.0.x"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: nuget
           path: ${{ env.NuGetDirectory }}
@@ -251,18 +253,18 @@ jobs:
           }
 
   publish-dev-artifacts:
-    if: github.event_name == 'pull_request'
+    if: always() && github.event_name == 'pull_request' && needs.validate-package.result == 'success'
     needs: [validate-package]
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: nuget
           path: ${{ env.NuGetDirectory }}
 
       - name: Upload dev packages as PR artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nuget-pr${{ github.event.pull_request.number }}
           if-no-files-found: error
