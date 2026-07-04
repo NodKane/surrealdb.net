@@ -1,6 +1,6 @@
-﻿using System.Collections;
+﻿using System.Collections.Concurrent;
+using System.Collections.Immutable;
 using System.Linq.Expressions;
-using Dahomey.Cbor;
 using Semver;
 using SurrealDb.Net.Internals.Queryable.Visitors;
 
@@ -74,44 +74,6 @@ public sealed class SurrealDbQueryProvider<T> : ISurrealDbQueryProvider, IAsyncQ
             return (TResult)result;
         }
 
-        if (
-            TryGetAnonymousEnumerableElementType(typeof(TResult), out _)
-            && TryFindSourceQueryable(expression, out var sourceQueryable)
-        )
-        {
-            await engine.EnsureVersionIsSetAsync(cancellationToken).ConfigureAwait(false);
-
-            var (sourceQuery, sourceParameters) = Translate(
-                sourceQueryable!.Expression,
-                engine.CachedVersion
-                    ?? throw new NullReferenceException(
-                        "Cannot detect version of the inner SurrealDB engine."
-                    ),
-                optimizeSelfProjection: true
-            );
-
-            var sourceResponse = await engine
-                .RawQuery(
-                    sourceQuery,
-                    sourceParameters,
-                    _sessionId,
-                    _transactionId,
-                    cancellationToken
-                )
-                .ConfigureAwait(false);
-            sourceResponse.EnsureAllOks();
-
-            var sourceItems = sourceResponse.GetValue<IEnumerable<T>>(0)!;
-
-            var inMemoryQueryable = sourceItems.AsQueryable();
-            var rewrittenExpression = new RootQueryableReplaceVisitor(
-                sourceQueryable,
-                inMemoryQueryable
-            ).Visit(expression)!;
-
-            return inMemoryQueryable.Provider.Execute<TResult>(rewrittenExpression)!;
-        }
-
         await engine.EnsureVersionIsSetAsync(cancellationToken).ConfigureAwait(false);
 
         var (query, parameters) = Translate(
@@ -119,8 +81,7 @@ public sealed class SurrealDbQueryProvider<T> : ISurrealDbQueryProvider, IAsyncQ
             engine.CachedVersion
                 ?? throw new NullReferenceException(
                     "Cannot detect version of the inner SurrealDB engine."
-                ),
-            optimizeSelfProjection: false
+                )
         );
 
         {
@@ -129,101 +90,65 @@ public sealed class SurrealDbQueryProvider<T> : ISurrealDbQueryProvider, IAsyncQ
                 .ConfigureAwait(false);
             result.EnsureAllOks();
 
-            try
-            {
-                return result.GetValue<TResult>(0)!;
-            }
-            catch (CborException)
-                when (TryGetFlattenedNestedEnumerableValue(result, out TResult? flattenedValue))
-            {
-                return flattenedValue!;
-            }
+            return result.GetValue<TResult>(0)!;
         }
     }
 
-    private static bool TryGetFlattenedNestedEnumerableValue<TResult>(
-        SurrealDb.Net.Models.Response.SurrealDbResponse response,
-        out TResult? value
-    )
-    {
-        value = default;
-
-        var resultType = typeof(TResult);
-        if (
-            !resultType.IsGenericType
-            || resultType.GetGenericTypeDefinition() != typeof(IEnumerable<>)
-        )
-        {
-            return false;
-        }
-
-        var elementType = resultType.GetGenericArguments()[0];
-        var nestedEnumerableType = typeof(IEnumerable<>).MakeGenericType(
-            typeof(IEnumerable<>).MakeGenericType(elementType)
-        );
-
-        try
-        {
-            var getValueMethod = typeof(SurrealDb.Net.Models.Response.SurrealDbResponse)
-                .GetMethod(nameof(SurrealDb.Net.Models.Response.SurrealDbResponse.GetValue))!
-                .MakeGenericMethod(nestedEnumerableType);
-            var nested = getValueMethod.Invoke(response, [0]);
-            if (nested is not IEnumerable outer)
-            {
-                return false;
-            }
-
-            var listType = typeof(List<>).MakeGenericType(elementType);
-            var flattened = (IList)Activator.CreateInstance(listType)!;
-
-            foreach (var inner in outer)
-            {
-                if (inner is not IEnumerable innerEnumerable)
-                {
-                    return false;
-                }
-
-                foreach (var item in innerEnumerable)
-                {
-                    flattened.Add(item);
-                }
-            }
-
-            value = (TResult)flattened;
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
+    private static readonly ConcurrentDictionary<
+        CachedQueryKey,
+        (string Query, HashSet<string> Parameters)
+    > _cachedQueries = new(
+        comparer: new CachedQueryKeyComparer(),
+        capacity: 0,
+        concurrencyLevel: Environment.ProcessorCount * 2
+    );
 
     public (string Query, IReadOnlyDictionary<string, object?> Parameters) Translate(
         Expression expression,
         SemVersion version
     )
     {
-        return Translate(expression, version, optimizeSelfProjection: true);
-    }
+        var (afterCacheExpression, cachedKey) = new CacheQueryExpressionVisitor().Bind(expression);
 
-    private (string Query, IReadOnlyDictionary<string, object?> Parameters) Translate(
-        Expression expression,
-        SemVersion version,
-        bool optimizeSelfProjection
-    )
-    {
+        if (cachedKey.HasValue && _cachedQueries.TryGetValue(cachedKey.Value, out var cachedQuery))
+        {
+            if (cachedQuery.Parameters.Count > 0)
+            {
+                // Run a simplified Visitor to extract current parameters
+                var parameters = new ExtractParametersExpressionVisitor().Bind(
+                    afterCacheExpression,
+                    cachedQuery.Parameters
+                );
+                return (cachedQuery.Query, parameters);
+            }
+
+            return (cachedQuery.Query, ImmutableDictionary<string, object?>.Empty);
+        }
+
         var (intermediateExpression, numberOfNamedValues, sourceExpressionParameters) =
-            new ToIntermediateExpressionVisitor().Bind(expression);
+            new ToIntermediateExpressionVisitor().Bind(afterCacheExpression);
+
+        bool isQueryCached = cachedKey.HasValue;
+
         var surrealExpressionResult = new SurrealExpressionVisitor(
             sourceExpressionParameters,
             numberOfNamedValues,
-            version,
-            optimizeSelfProjection
+            version
         ).Bind(intermediateExpression);
         var surrealExpression = (Expressions.Surreal.SurrealExpression)
             surrealExpressionResult.Expression;
-        // TODO : Check and replace "always true" operations
-        // TODO : Check and replace SELECT FROM record ID if operation "== RecordId"
+
+        if (!isQueryCached)
+        {
+            // TODO : Check and replace "always true" operations
+            var afterToRecordIdExpression = new ToRecordIdExpressionVisitor().Transform(
+                surrealExpression,
+                surrealExpressionResult.Parameters
+            );
+
+            surrealExpression = afterToRecordIdExpression;
+        }
+
         int approximatedQueryLength = new ApproximateQueryLengthExpressionVisitor().Approximate(
             surrealExpression
         );
@@ -232,77 +157,14 @@ public sealed class SurrealDbQueryProvider<T> : ISurrealDbQueryProvider, IAsyncQ
             approximatedQueryLength
         );
 
+        if (cachedKey.HasValue)
+        {
+            _cachedQueries.TryAdd(
+                cachedKey.Value,
+                (query, surrealExpressionResult.Parameters.Keys.ToHashSet())
+            );
+        }
+
         return (query, surrealExpressionResult.Parameters);
-    }
-
-    private static bool TryGetAnonymousEnumerableElementType(Type resultType, out Type? elementType)
-    {
-        elementType = null;
-
-        if (
-            !resultType.IsGenericType
-            || resultType.GetGenericTypeDefinition() != typeof(IEnumerable<>)
-        )
-        {
-            return false;
-        }
-
-        var candidate = resultType.GetGenericArguments()[0];
-        bool isAnonymous =
-            Attribute.IsDefined(
-                candidate,
-                typeof(System.Runtime.CompilerServices.CompilerGeneratedAttribute),
-                false
-            )
-            && candidate.Name.Contains("AnonymousType", StringComparison.Ordinal)
-            && candidate.IsGenericType;
-        if (!isAnonymous)
-        {
-            return false;
-        }
-
-        elementType = candidate;
-        return true;
-    }
-
-    private static bool TryFindSourceQueryable(
-        Expression expression,
-        out SurrealDbQueryable<T>? sourceQueryable
-    )
-    {
-        sourceQueryable = expression switch
-        {
-            ConstantExpression { Value: SurrealDbQueryable<T> surrealQueryable } =>
-                surrealQueryable,
-            MethodCallExpression methodCallExpression => methodCallExpression
-                .Arguments.Select(arg =>
-                    TryFindSourceQueryable(arg, out var innerSourceQueryable)
-                        ? innerSourceQueryable
-                        : null
-                )
-                .FirstOrDefault(queryable => queryable is not null),
-            _ => null,
-        };
-
-        return sourceQueryable is not null;
-    }
-
-    private sealed class RootQueryableReplaceVisitor(
-        SurrealDbQueryable<T> sourceQueryable,
-        IQueryable<T> replacementQueryable
-    ) : ExpressionVisitor
-    {
-        private readonly SurrealDbQueryable<T> _sourceQueryable = sourceQueryable;
-        private readonly IQueryable<T> _replacementQueryable = replacementQueryable;
-
-        protected override Expression VisitConstant(ConstantExpression node)
-        {
-            if (ReferenceEquals(node.Value, _sourceQueryable))
-            {
-                return Expression.Constant(_replacementQueryable, typeof(IQueryable<T>));
-            }
-
-            return base.VisitConstant(node);
-        }
     }
 }

@@ -1,4 +1,4 @@
-﻿using System.Collections;
+using System.Collections;
 using System.Collections.Immutable;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
@@ -24,7 +24,6 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
     private readonly Dictionary<string, object?> _parameters;
     private readonly Dictionary<string, object?> _recordIdParameters = [];
     private readonly SemVersion _surrealVersion;
-    private readonly bool _optimizeSelfProjection;
 
     private int _currentNestedSelectLevel = 0;
     private readonly Dictionary<ParameterExpression, int> _parametersNestedLevels = [];
@@ -32,14 +31,12 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
     public SurrealExpressionVisitor(
         Dictionary<ParameterExpression, Expression> sourceExpressionParameters,
         int numberOfNamedValues,
-        SemVersion surrealVersion,
-        bool optimizeSelfProjection = true
+        SemVersion surrealVersion
     )
     {
         _sourceExpressionParameters = sourceExpressionParameters;
         _parameters = new(numberOfNamedValues);
         _surrealVersion = surrealVersion;
-        _optimizeSelfProjection = optimizeSelfProjection;
     }
 
     internal (Expression Expression, IReadOnlyDictionary<string, object?> Parameters) Bind(
@@ -107,6 +104,9 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
         var ordering = (OrderingExpression?)Visit(selectExpression.Orders);
         var limit = (LimitExpression?)Visit(selectExpression.Take);
         var start = (StartExpression?)Visit(selectExpression.Skip);
+        var explain = selectExpression.Explain.HasValue
+            ? new ExplainExpression(selectExpression.Explain.Value)
+            : null;
 
         var fieldsIdioms = fields.Fields.Select(f =>
             ((SingleFieldExpression)f).Expression.ToIdiom()
@@ -139,7 +139,8 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
                     ordering,
                     limit,
                     start,
-                    false
+                    false,
+                    explain
                 )
             );
 
@@ -151,7 +152,8 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
                 order: null,
                 limit: null,
                 start: null,
-                selectExpression.SingleValue
+                selectExpression.SingleValue,
+                explain
             );
         }
 
@@ -163,7 +165,8 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
             ordering,
             limit,
             start,
-            selectExpression.SingleValue
+            selectExpression.SingleValue,
+            explain
         );
     }
 
@@ -177,10 +180,7 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
                 return FieldsExpression.ForType(projectionExpression.Type);
             }
 
-            if (
-                _optimizeSelfProjection
-                && TryGetSourceTypeForSelfProjection(innerExpression, out var sourceType)
-            )
+            if (TryGetSourceTypeForSelfProjection(innerExpression, out var sourceType))
             {
                 return FieldsExpression.ForType(sourceType);
             }
@@ -284,6 +284,11 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
             );
         }
 
+        if (projectionExpression is AllFieldsProjectionExpression)
+        {
+            return new FieldsExpression([new AllFieldExpression()]);
+        }
+
         throw new NotSupportedException(
             $"The projection of '{projectionExpression.Type}' is not supported."
         );
@@ -308,10 +313,22 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
         var valueExpression = innerExpression?.ToValue();
         if (valueExpression is not null)
         {
-            var alias = string.IsNullOrWhiteSpace(fieldProjectionExpression.Alias)
+            IdiomExpression? aliasIdiom = string.IsNullOrWhiteSpace(fieldProjectionExpression.Alias)
                 ? null
                 : new IdiomExpression([new FieldPartExpression(fieldProjectionExpression.Alias)]);
-            return new SingleFieldExpression(valueExpression, alias);
+
+            // Suppress redundant alias when field name == alias (e.g. "Age AS Age" → "Age")
+            if (
+                aliasIdiom is not null
+                && valueExpression
+                    is IdiomValueExpression { Idiom.IsSingleFieldPart: true } idiomValue
+                && idiomValue.Idiom.IsSame(aliasIdiom)
+            )
+            {
+                aliasIdiom = null;
+            }
+
+            return new SingleFieldExpression(valueExpression, aliasIdiom);
         }
 
         throw new NotSupportedException(
@@ -328,8 +345,11 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
             SelectSourceExpression selectSourceExpression => ToSubqueryValueExpression(
                 selectSourceExpression
             ),
+            CustomSourceExpression customSourceExpression => ToCustomValueExpression(
+                customSourceExpression
+            ),
             _ => throw new InvalidCastException(
-                $"Failed to convert source expression of type '{sourceExpression.Type.Name}' to WhatExpression."
+                $"Failed to convert source expression of type '{sourceExpression.Type.Name}' to {nameof(WhatExpression)}."
             ),
         };
         return WhatExpression.From(value);
@@ -344,6 +364,15 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
             );
             _currentNestedSelectLevel--;
             return returnedExpression;
+        }
+
+        ValueExpression ToCustomValueExpression(CustomSourceExpression customSourceExpression)
+        {
+            var visited = Visit(customSourceExpression.Custom)?.ToValue();
+            return visited
+                ?? throw new InvalidCastException(
+                    $"Failed to convert {nameof(CustomSourceExpression)} to a value expression."
+                );
         }
     }
 
@@ -470,7 +499,16 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
 
     private Expression? BindCustom(CustomExpression customExpression)
     {
-        return Visit(customExpression.Expression);
+        var inner = Visit(customExpression.Expression);
+        if (customExpression.Flatten)
+        {
+            var valueExpression = inner?.ToValue();
+            if (valueExpression is not null)
+            {
+                return new FunctionValueExpression("array::flatten", [valueExpression]);
+            }
+        }
+        return inner;
     }
 
     private Expression? BindLambda(LambdaIntermediateExpression lambdaExpression)
@@ -823,6 +861,7 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
                 ]
             ),
             ISpatial spatialValue => new GeometryValueExpression(spatialValue),
+            SurrealFile file => new SurrealFileValueExpression(file),
             _ => node,
         };
     }
@@ -1421,10 +1460,7 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
     protected override Expression VisitMethodCall(MethodCallExpression node)
     {
         if (
-            node.Method.Name.Equals(
-                nameof(Nullable<int>.GetValueOrDefault),
-                StringComparison.Ordinal
-            )
+            node.Method.Name.Equals(nameof(Nullable<>.GetValueOrDefault), StringComparison.Ordinal)
             && node.Method.DeclaringType?.IsGenericType == true
             && node.Method.DeclaringType.GetGenericTypeDefinition() == typeof(Nullable<>)
         )
@@ -1453,6 +1489,10 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
         {
             return BindDateTimeMethodCall(node);
         }
+        if (node.Method.DeclaringType == typeof(TimeSpan))
+        {
+            return BindTimeSpanMethodCall(node);
+        }
 #if NET6_0_OR_GREATER
         if (node.Method.DeclaringType == typeof(DateOnly))
         {
@@ -1463,10 +1503,6 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
             return BindTimeOnlyMethodCall(node);
         }
 #endif
-        if (node.Method.DeclaringType == typeof(TimeSpan))
-        {
-            return BindTimeSpanMethodCall(node);
-        }
         if (
             _surrealVersion.Major >= 3
             && node.Method.DeclaringType is { } declaringType
@@ -1477,7 +1513,7 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
         }
 
         if (
-            node.Method.Name.Equals("op_Implicit", StringComparison.Ordinal)
+            node.Method.Name.Equals("op_Implicit", StringComparison.Ordinal) // Implicit conversion
             && node.Method.DeclaringType is { IsGenericType: true } spanType
             && spanType.GetGenericTypeDefinition() == typeof(ReadOnlySpan<>)
             && node.Arguments.Count == 1
@@ -1513,7 +1549,7 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
 
         if (
             node.Object is not null
-            && node.Method.Name.Equals(nameof(List<object>.Contains), StringComparison.Ordinal)
+            && node.Method.Name.Equals(nameof(List<>.Contains), StringComparison.Ordinal)
             && node.Arguments.Count == 1
             && node.Object.Type != typeof(string)
             && typeof(IEnumerable).IsAssignableFrom(node.Object.Type)
@@ -1646,6 +1682,11 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
                 );
             }
 
+            if (valueExpression is DateTimeValueExpression dateTimeValue)
+            {
+                return new DateTimeValueExpression(dateTimeValue.Value.Date);
+            }
+
             return new FunctionValueExpression(
                 "time::floor",
                 [valueExpression, new DurationValueExpression(TimeSpan.FromDays(1))]
@@ -1666,6 +1707,11 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
                 throw new InvalidCastException(
                     "The first argument of TimeOnly.FromDateTime must be a value expression."
                 );
+            }
+
+            if (valueExpression is DateTimeValueExpression dateTimeValue)
+            {
+                return new DurationValueExpression(dateTimeValue.Value.TimeOfDay);
             }
 
             return new FunctionValueExpression(
@@ -3052,12 +3098,12 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
                             $"The selector argument '{arg}' is not supported in Enumerable.Select projection."
                         );
                     })
-                    .OrderBy(fieldName => fieldName, StringComparer.Ordinal)
+                    .OrderBy(field => field, StringComparer.Ordinal)
                     .ToImmutableArray();
 
                 return new IdiomExpression(
                     [
-                        new DeconstructPartExpression(
+                        new DestructurePartExpression(
                             fieldPartExpression.FieldName,
                             deconstructFields
                         ),
@@ -3076,14 +3122,41 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
         }
         if (node.Method.Name.Equals(nameof(Enumerable.SelectMany), StringComparison.Ordinal))
         {
+            if (node.Arguments.Count == 2)
+            {
+                LambdaExpression? lambda = node.Arguments[1] switch
+                {
+                    LambdaIntermediateExpression lambdaIntermediate =>
+                        lambdaIntermediate.Expression,
+                    LambdaExpression lambdaExpression => lambdaExpression,
+                    UnaryExpression
+                    {
+                        NodeType: ExpressionType.Quote,
+                        Operand: LambdaExpression lambdaExpression
+                    } => lambdaExpression,
+                    _ => null,
+                };
+                if (lambda is not null)
+                {
+                    var fieldValue = Visit(lambda.Body)?.ToValue();
+                    if (fieldValue is null)
+                    {
+                        throw new InvalidCastException(
+                            $"The selector of {node.Method.DeclaringType!.Name}.SelectMany must be a value expression."
+                        );
+                    }
+                    return new FunctionValueExpression("array::flatten", [fieldValue]);
+                }
+            }
+
             var valueExpression = Visit(node.Arguments[0])?.ToValue();
             if (valueExpression is null)
             {
                 throw new InvalidCastException(
-                    $"The first argument of {node.Method.DeclaringType!.Name}.Reverse must be a value expression."
+                    $"The first argument of {node.Method.DeclaringType!.Name}.SelectMany must be a value expression."
                 );
             }
-            return new FunctionValueExpression("array::reverse", [valueExpression]);
+            return new FunctionValueExpression("array::flatten", [valueExpression]);
         }
         if (node.Method.Name.Equals(nameof(Enumerable.Skip), StringComparison.Ordinal))
         {
@@ -3120,7 +3193,7 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
             if (valueExpression2 is null)
             {
                 throw new InvalidCastException(
-                    $"The second argument of {node.Method.DeclaringType!.Name}.Union must be a value expression."
+                    $"The second argument of {node.Method.DeclaringType!.Name}.Sum must be a value expression."
                 );
             }
             var sourceExpression = Visit(node.Arguments[0]);
@@ -3176,7 +3249,7 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
                     $"The first argument of {node.Method.DeclaringType!.Name}.ToArray must be a value expression."
                 );
             }
-            if (valueExpression is IdiomValueExpression)
+            if (valueExpression is IdiomValueExpression && !node.Arguments[0].Type.IsHashSet())
             {
                 return valueExpression;
             }
@@ -3928,13 +4001,10 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
 
         static MemberExpression? TryExtractRootMember(Expression arg)
         {
-            if (arg is MemberExpression memberExpression)
+            return arg switch
             {
-                return memberExpression;
-            }
-
-            if (
-                arg is MethodCallExpression
+                MemberExpression memberExpression => memberExpression,
+                MethodCallExpression
                 {
                     Method.Name: nameof(Enumerable.ToArray),
                     Arguments: [
@@ -3944,13 +4014,9 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
                             Arguments: [MemberExpression sourceMemberExpression, ..],
                         },
                     ],
-                }
-            )
-            {
-                return sourceMemberExpression;
-            }
-
-            return null;
+                } => sourceMemberExpression,
+                _ => null,
+            };
         }
 
         var extractedMembers = newExpression.Arguments.Select(TryExtractRootMember).ToArray();

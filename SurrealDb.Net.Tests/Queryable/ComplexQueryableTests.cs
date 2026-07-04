@@ -2,8 +2,16 @@
 
 namespace SurrealDb.Net.Tests.Queryable;
 
-public class ComplexQueryableTests
+public class ComplexQueryableTests : BaseQueryableTests
 {
+    private readonly VerifySettings _verifySettings = new();
+
+    public ComplexQueryableTests()
+    {
+        _verifySettings.UseDirectory("Snapshots");
+        _verifySettings.IgnoreParameters();
+    }
+
     [Test]
     [RemoteConnectionStringFixtureGenerator]
     public async Task ShouldSelectWithComplexQuery(string connectionString)
@@ -41,7 +49,7 @@ public class ComplexQueryableTests
     [WebsocketConnectionStringFixtureGenerator]
     public async Task ShouldGetFullOrdersSortedDescending(string connectionString)
     {
-        var (result, query) = await ExecuteWithSchema(
+        var (result, query) = await ExecuteWithSchemaAsync(
             connectionString,
             SurrealSchemaFile.Store,
             client => client.Select<StoreOrder>().OrderByDescending(d => d.CreatedAt)
@@ -52,25 +60,9 @@ public class ComplexQueryableTests
             .Be(
                 "SELECT user.{created_at,email,id,name}, products.{created_at,description,id,name,price}, total, created_at, id FROM orders ORDER BY created_at DESC"
             );
-        result.Should().NotBeNull().And.HaveCount(10);
+
+        await Verify(result, _verifySettings);
         result.Should().BeInDescendingOrder(o => o.CreatedAt);
-        result
-            .Should()
-            .AllSatisfy(order =>
-            {
-                order.Products.Should().NotBeEmpty();
-                order
-                    .Products.Should()
-                    .AllSatisfy(product =>
-                    {
-                        product.Should().NotBeNull();
-                        product.Id.Should().NotBeNull();
-                        product.Name.Should().NotBeNullOrWhiteSpace();
-                        product.Description.Should().NotBeNullOrWhiteSpace();
-                        product.Price.Should().BeGreaterThan(0);
-                        product.CreatedAt.Should().NotBeNull();
-                    });
-            });
     }
 
     [Test]
@@ -85,10 +77,8 @@ public class ComplexQueryableTests
         await client.ApplySchemaAsync(SurrealSchemaFile.Store);
 
         var queryable = client.Select<StoreOrder>().Select(order => order.Products.Count());
-        var query = queryable.ToQueryString();
         var result = await queryable.SumAsync();
 
-        query.Should().Be("SELECT VALUE array::len(products) FROM orders");
         result.Should().Be(20);
     }
 
@@ -96,7 +86,7 @@ public class ComplexQueryableTests
     [WebsocketConnectionStringFixtureGenerator]
     public async Task ShouldGetPartialOrders(string connectionString)
     {
-        var (result, query) = await ExecuteWithSchema(
+        var (result, query) = await ExecuteWithSchemaAsync(
             connectionString,
             SurrealSchemaFile.Store,
             client =>
@@ -119,30 +109,15 @@ public class ComplexQueryableTests
             .Be(
                 "SELECT user.name AS customer, products.{description,name} AS products, total FROM orders"
             );
-        result.Should().NotBeNull().And.HaveCount(10);
-        result
-            .Should()
-            .AllSatisfy(order =>
-            {
-                order.products.Should().NotBeEmpty();
-                order.total.Should().BeGreaterThan(0);
-                order.customer.Should().NotBeNullOrWhiteSpace();
-                order
-                    .products.Should()
-                    .AllSatisfy(product =>
-                    {
-                        product.Should().NotBeNull();
-                        product.name.Should().NotBeNullOrWhiteSpace();
-                        product.description.Should().NotBeNullOrWhiteSpace();
-                    });
-            });
+
+        await Verify(result, _verifySettings);
     }
 
     [Test]
     [WebsocketConnectionStringFixtureGenerator]
     public async Task ShouldProjectComputedAndConstantFields(string connectionString)
     {
-        var (result, query) = await ExecuteWithSchema(
+        var (result, query) = await ExecuteWithSchemaAsync(
             connectionString,
             SurrealSchemaFile.Store,
             client =>
@@ -159,25 +134,19 @@ public class ComplexQueryableTests
         query
             .Should()
             .Be(
-                "SELECT !array::is_empty(products) AS hasProducts, id, array::len(products) AS productCount, \"store\" AS source FROM orders"
+                """
+                SELECT !array::is_empty(products) AS hasProducts, id, array::len(products) AS productCount, "store" AS source FROM orders
+                """
             );
-        result.Should().NotBeNull().And.HaveCount(10);
-        result
-            .Should()
-            .AllSatisfy(order =>
-            {
-                order.hasProducts.Should().BeTrue();
-                order.id.Should().NotBeNull();
-                order.productCount.Should().BeGreaterThan(0);
-                order.source.Should().Be("store");
-            });
+
+        await Verify(result, _verifySettings);
     }
 
     [Test]
     [WebsocketConnectionStringFixtureGenerator]
     public async Task ShouldGetFirstAndLastOrderDateForCustomer(string connectionString)
     {
-        var (result, query) = await ExecuteWithSchema(
+        var (result, query) = await ExecuteWithSchemaAsync(
             connectionString,
             SurrealSchemaFile.Store,
             client =>
@@ -194,14 +163,17 @@ public class ComplexQueryableTests
                     })
         );
 
-        var firstOrderAt = result.Min(item => item.OrderDate);
-        var lastOrderAt = result.Max(item => item.OrderDate);
-
         query
             .Should()
             .Be(
-                "SELECT time::floor(created_at ?? d\"0001-01-01T00:00:00.0000000Z\", 1d) AS OrderDate, duration::from_nanos(time::nano(created_at ?? d\"0001-01-01T00:00:00.0000000Z\") % 86400000000000) AS OrderTime FROM orders WHERE time::floor(created_at ?? d\"0001-01-01T00:00:00.0000000Z\", 1d) >= time::floor(d\"0001-01-01T00:00:00.0000000Z\", 1d)"
+                """
+                SELECT time::floor(created_at ?? d"0001-01-01T00:00:00.0000000Z", 1d) AS OrderDate, duration::from_nanos(time::nano(created_at ?? d"0001-01-01T00:00:00.0000000Z") % 86400000000000) AS OrderTime FROM orders WHERE time::floor(created_at ?? d"0001-01-01T00:00:00.0000000Z", 1d) >= d"0001-01-01T00:00:00.0000000Z"
+                """
             );
+
+        var firstOrderAt = result.Min(item => item.OrderDate);
+        var lastOrderAt = result.Max(item => item.OrderDate);
+
         firstOrderAt.Should().BeOnOrBefore(lastOrderAt);
         result.Should().OnlyContain(item => item.OrderTime >= TimeOnly.MinValue);
     }
@@ -210,7 +182,7 @@ public class ComplexQueryableTests
     [WebsocketConnectionStringFixtureGenerator]
     public async Task ShouldFlattenOrderedProductsWithSelectMany(string connectionString)
     {
-        var (result, query) = await ExecuteWithSchema(
+        var (result, query) = await ExecuteWithSchemaAsync(
             connectionString,
             SurrealSchemaFile.Store,
             client => client.Select<StoreOrder>().SelectMany(order => order.Products)
@@ -219,9 +191,12 @@ public class ComplexQueryableTests
         query
             .Should()
             .Be(
-                "(SELECT array::flatten(products.{created_at,description,id,name,price}) AS Values FROM orders GROUP ALL)[0].Values"
+                """
+                array::flatten((SELECT array::flatten(products.{created_at,description,id,name,price}) AS Values FROM orders GROUP ALL)[0].Values)
+                """
             );
-        result.Should().NotBeNull().And.HaveCount(20);
+
+        await Verify(result, _verifySettings);
     }
 
     [Test]
@@ -232,7 +207,7 @@ public class ComplexQueryableTests
     {
         const float minPrice = 100;
 
-        var (result, query) = await ExecuteWithSchema(
+        var (result, query) = await ExecuteWithSchemaAsync(
             connectionString,
             SurrealSchemaFile.Store,
             client =>
@@ -247,20 +222,20 @@ public class ComplexQueryableTests
         query
             .Should()
             .Be(
-                "(SELECT array::flatten(products.{created_at,description,id,name,price}) AS Values FROM orders GROUP ALL)[0].Values"
+                """
+                SELECT name AS Name, price AS Price FROM array::flatten((SELECT array::flatten(products.{created_at,description,id,name,price}) AS Values FROM orders GROUP ALL)[0].Values) WHERE price > 100 ORDER BY price
+                """
             );
-        result.Should().NotBeNull().And.NotBeEmpty();
-        result.Should().OnlyContain(product => product.Price > minPrice);
-        result.Should().BeInAscendingOrder(product => product.Price);
-        result.Should().OnlyContain(product => !string.IsNullOrWhiteSpace(product.Name));
+
+        await Verify(result, _verifySettings);
     }
 
     [Test]
     [WebsocketConnectionStringFixtureGenerator]
     public async Task ShouldSplitQueryWhenOrderingByFieldOutsideProjection(string connectionString)
     {
-        var minTotal = 200;
-        var (result, query) = await ExecuteWithSchema(
+        int minTotal = 200;
+        var (result, query) = await ExecuteWithSchemaAsync(
             connectionString,
             SurrealSchemaFile.Store,
             client =>
@@ -280,47 +255,8 @@ public class ComplexQueryableTests
             .Be(
                 "SELECT user.name AS customer, id, total FROM (SELECT user.name, id, total, created_at FROM orders WHERE total > <float> $minTotal ORDER BY created_at DESC)"
             );
-        result.Should().NotBeNull().And.HaveCount(3);
-        result
-            .Should()
-            .AllSatisfy(order =>
-            {
-                order.id.Should().NotBeNull();
-                order.customer.Should().NotBeNullOrWhiteSpace();
-                order.total.Should().BeGreaterThan(minTotal);
-            });
-    }
 
-    [Test]
-    [WebsocketConnectionStringFixtureGenerator]
-    public async Task ShouldRoundSumProductCosts(string connectionString)
-    {
-        var (result, query) = await ExecuteWithSchema(
-            connectionString,
-            SurrealSchemaFile.Store,
-            client =>
-                client
-                    .Select<StoreOrder>()
-                    .Select(order => new
-                    {
-                        Total = order.Total,
-                        ProductCosts = (float)
-                            Math.Round(order.Products.Sum(product => product.Price), 2),
-                    })
-        );
-
-        query
-            .Should()
-            .Be(
-                "SELECT <float> math::fixed(<float> math::sum(products.price), 2) AS ProductCosts, total AS Total FROM orders"
-            );
-        result.Should().NotBeEmpty().And.HaveCount(10);
-        result
-            .Should()
-            .AllSatisfy(order =>
-            {
-                order.Total.Should().Be(order.ProductCosts);
-            });
+        await Verify(result, _verifySettings);
     }
 
     [Test]
@@ -328,7 +264,7 @@ public class ComplexQueryableTests
     public async Task ShouldGetTopOrdersByTotal(string connectionString)
     {
         const int top = 3;
-        var (result, query) = await ExecuteWithSchema(
+        var (result, query) = await ExecuteWithSchemaAsync(
             connectionString,
             SurrealSchemaFile.Store,
             client =>
@@ -346,6 +282,7 @@ public class ComplexQueryableTests
         query
             .Should()
             .Be("SELECT user.name AS customer, id, total FROM orders ORDER BY total DESC LIMIT 3");
+
         result.Should().NotBeNull().And.HaveCount(top);
         result.Should().BeInDescendingOrder(order => order.total);
         result
@@ -362,74 +299,99 @@ public class ComplexQueryableTests
     [WebsocketConnectionStringFixtureGenerator]
     public async Task ShouldGetProductsFromBerlinOrMunichWarehouses(string connectionString)
     {
-        var listLocations = new List<string> { "Berlin", "Munich" };
-        var (listResult, listQuery) = await ExecuteWithSchema(
-            connectionString,
-            SurrealSchemaFile.Store,
-            client =>
-                client
-                    .Select<Inventory>()
-                    .Where(inventory => listLocations.Contains(inventory.Warehouse.Location))
-                    .Select(inventory => inventory.Product.Name)
-        );
+        var verifySettings = new VerifySettings(_verifySettings);
+        verifySettings.DisableRequireUniquePrefix();
 
-        listQuery
-            .Should()
-            .Be(
-                "SELECT VALUE product.name FROM inventory WHERE $listLocations CONTAINS warehouse.location"
-            );
-        AssertResult(listResult);
+        const string expectedQuery =
+            "SELECT VALUE product.name FROM inventory WHERE $locations CONTAINS warehouse.location";
 
-        var hashSetLocations = new HashSet<string> { "Berlin", "Munich" };
-        var (hashSetResult, hashSetQuery) = await ExecuteWithSchema(
-            connectionString,
-            SurrealSchemaFile.Store,
-            client =>
-                client
-                    .Select<Inventory>()
-                    .Where(inventory => hashSetLocations.Contains(inventory.Warehouse.Location))
-                    .Select(inventory => inventory.Product.Name)
-        );
-
-        hashSetQuery
-            .Should()
-            .Be(
-                "SELECT VALUE product.name FROM inventory WHERE $hashSetLocations CONTAINS warehouse.location"
-            );
-        AssertResult(hashSetResult);
-
-        string[] arrayLocations = ["Berlin", "Munich"];
-        var (arrayResult, arrayQuery) = await ExecuteWithSchema(
-            connectionString,
-            SurrealSchemaFile.Store,
-            client =>
-                client
-                    .Select<Inventory>()
-                    .Where(inventory => arrayLocations.Contains(inventory.Warehouse.Location))
-                    .Select(inventory => inventory.Product.Name)
-        );
-
-        arrayQuery
-            .Should()
-            .Be(
-                "SELECT VALUE product.name FROM inventory WHERE $arrayLocations CONTAINS warehouse.location"
-            );
-        AssertResult(arrayResult);
-
-        static void AssertResult(ICollection<string> result)
         {
-            result.Should().NotBeNull().And.HaveCount(12);
-            result.Should().OnlyContain(productName => !string.IsNullOrWhiteSpace(productName));
-            result.Should().Contain("Laptop");
-            result.Should().Contain("Headphones");
+            var locations = new List<string> { "Berlin", "Munich" };
+            var (result, query) = await ExecuteWithSchemaAsync(
+                connectionString,
+                SurrealSchemaFile.Store,
+                client =>
+                    client
+                        .Select<Inventory>()
+                        .Where(inventory => locations.Contains(inventory.Warehouse.Location))
+                        .Select(inventory => inventory.Product.Name)
+            );
+
+            query.Should().Be(expectedQuery);
+            await Verify(result, verifySettings);
         }
+
+        {
+            var locations = new HashSet<string> { "Berlin", "Munich" };
+            var (result, query) = await ExecuteWithSchemaAsync(
+                connectionString,
+                SurrealSchemaFile.Store,
+                client =>
+                    client
+                        .Select<Inventory>()
+                        .Where(inventory => locations.Contains(inventory.Warehouse.Location))
+                        .Select(inventory => inventory.Product.Name)
+            );
+
+            query.Should().Be(expectedQuery);
+            await Verify(result, verifySettings);
+        }
+
+        {
+            string[] locations = ["Berlin", "Munich"];
+            var (result, query) = await ExecuteWithSchemaAsync(
+                connectionString,
+                SurrealSchemaFile.Store,
+                client =>
+                    client
+                        .Select<Inventory>()
+                        .Where(inventory => locations.Contains(inventory.Warehouse.Location))
+                        .Select(inventory => inventory.Product.Name)
+            );
+
+            query.Should().Be(expectedQuery);
+            await Verify(result, verifySettings);
+        }
+    }
+
+    [Test]
+    [WebsocketConnectionStringFixtureGenerator]
+    public async Task ShouldRoundSumProductCosts(string connectionString)
+    {
+        var (result, query) = await ExecuteWithSchemaAsync(
+            connectionString,
+            SurrealSchemaFile.Store,
+            client =>
+                client
+                    .Select<StoreOrder>()
+                    .Select(order => new
+                    {
+                        order.Total,
+                        ProductCosts = (float)
+                            Math.Round(order.Products.Sum(product => product.Price), 2),
+                    })
+        );
+
+        query
+            .Should()
+            .Be(
+                "SELECT <float> math::fixed(<float> math::sum(products.price), 2) AS ProductCosts, total AS Total FROM orders"
+            );
+
+        result.Should().NotBeEmpty().And.HaveCount(10);
+        result
+            .Should()
+            .AllSatisfy(order =>
+            {
+                order.Total.Should().Be(order.ProductCosts);
+            });
     }
 
     [Test]
     [WebsocketConnectionStringFixtureGenerator]
     public async Task ShouldRoundToIntSumProductCosts(string connectionString)
     {
-        var (result, query) = await ExecuteWithSchema(
+        var (result, query) = await ExecuteWithSchemaAsync(
             connectionString,
             SurrealSchemaFile.Store,
             client =>
@@ -448,6 +410,7 @@ public class ComplexQueryableTests
             .Be(
                 "SELECT <float> math::round(<float> math::sum(products.price)) AS ProductCosts, <float> math::round(<float> total) AS Total FROM orders"
             );
+
         result.Should().NotBeEmpty().And.HaveCount(10);
         result
             .Should()
@@ -468,15 +431,13 @@ public class ComplexQueryableTests
         await using var client = surrealDbClientGenerator.Create(connectionString);
         await client.Use(dbInfo.Namespace, dbInfo.Database);
         await client.ApplySchemaAsync(SurrealSchemaFile.Store);
+
         var queryable = client
             .Select<StoreOrder>()
             .Select(order => order.Products.Sum(product => product.Price));
-        var query = queryable.ToQueryString();
+
         var result = await queryable.SumAsync();
 
-        // Due to optimizeSelfProjection the query is not exactly what we would expect, but it should still work correctly
-        // math::sum(SELECT VALUE math::sum(products.price) FROM orders)
-        query.Should().Be("SELECT VALUE math::sum(products.price) FROM orders");
         result.Should().BeApproximately(3879.8f, 0.1f);
     }
 
@@ -492,24 +453,4 @@ public class ComplexQueryableTests
     );
 
     private record OrderedOrderProjection(RecordId? id, string customer, float total);
-
-    private static async Task<(List<T> Result, string Query)> ExecuteWithSchema<T>(
-        string connectionString,
-        SurrealSchemaFile schema,
-        Func<SurrealDbClient, IQueryable<T>> queryFactory
-    )
-    {
-        await using var surrealDbClientGenerator = new SurrealDbClientGenerator();
-        var dbInfo = surrealDbClientGenerator.GenerateDatabaseInfo();
-
-        await using var client = surrealDbClientGenerator.Create(connectionString);
-        await client.Use(dbInfo.Namespace, dbInfo.Database);
-        await client.ApplySchemaAsync(schema);
-
-        var query = queryFactory(client);
-        var queryString = query.ToQueryString();
-        var result = await query.ToListAsync();
-
-        return (result, queryString);
-    }
 }

@@ -801,16 +801,66 @@ internal sealed class RecordIdValueExpression
         IPrintableExpression,
         IConstantValueExpression
 {
-    private readonly RecordId _value;
+    internal RecordId Value { get; }
 
-    private RecordIdValueExpression(RecordId value)
+    internal RecordIdValueExpression(RecordId value)
     {
-        _value = value;
+        Value = value;
     }
 
     public void AppendTo(StringBuilder stringBuilder)
     {
-        stringBuilder.Append(_value);
+        stringBuilder.Append(Value.Table);
+        stringBuilder.Append(':');
+
+        switch (Value)
+        {
+            case RecordIdOfString recordIdOfString:
+                stringBuilder.Append('`');
+                stringBuilder.Append(recordIdOfString.Id);
+                stringBuilder.Append('`');
+                break;
+            case RecordIdOf<string> stringRecord:
+                stringBuilder.Append('`');
+                stringBuilder.Append(stringRecord.Id);
+                stringBuilder.Append('`');
+                break;
+            case RecordIdOf<int> intRecord:
+                stringBuilder.Append(intRecord.Id);
+                break;
+            case RecordIdOf<long> longRecord:
+                stringBuilder.Append(longRecord.Id);
+                break;
+            case RecordIdOf<Guid> guidRecord:
+                stringBuilder.Append('u');
+                stringBuilder.Append('\'');
+                stringBuilder.Append(guidRecord.Id.ToString());
+                stringBuilder.Append('\'');
+                break;
+            default:
+                throw new InvalidOperationException();
+        }
+    }
+}
+
+internal sealed class SurrealFileValueExpression
+    : ValueExpression,
+        IPrintableExpression,
+        IConstantValueExpression
+{
+    public readonly SurrealFile Value;
+
+    public SurrealFileValueExpression(SurrealFile value)
+    {
+        Value = value;
+    }
+
+    public void AppendTo(StringBuilder stringBuilder)
+    {
+        stringBuilder.Append('f');
+        stringBuilder.Append('"');
+        stringBuilder.Append(Value);
+        stringBuilder.Append('"');
     }
 }
 
@@ -819,17 +869,17 @@ internal sealed class ParameterValueExpression
         IPrintableExpression,
         IConstantValueExpression
 {
-    private readonly string _name;
+    internal string Name { get; }
 
     public ParameterValueExpression(string name)
     {
-        _name = name;
+        Name = name;
     }
 
     public void AppendTo(StringBuilder stringBuilder)
     {
         stringBuilder.Append('$');
-        stringBuilder.Append(_name);
+        stringBuilder.Append(Name);
     }
 }
 
@@ -848,22 +898,22 @@ internal sealed class TableValueExpression
         IPrintableExpression,
         IConstantValueExpression
 {
-    private readonly string _value;
+    public readonly string Value;
 
     public TableValueExpression(string value)
     {
-        _value = value;
+        Value = value;
     }
 
     public void AppendTo(StringBuilder stringBuilder)
     {
-        bool shouldEscape = ShouldEspaceIdent(_value);
+        bool shouldEscape = ShouldEspaceIdent(Value);
 
         if (shouldEscape)
         {
             stringBuilder.Append('`');
         }
-        stringBuilder.Append(_value);
+        stringBuilder.Append(Value);
         if (shouldEscape)
         {
             stringBuilder.Append('`');
