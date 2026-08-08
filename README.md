@@ -40,6 +40,9 @@ The official SurrealDB SDK for .NET.
 
 View the SDK documentation [here](https://surrealdb.com/docs/integration/libraries/dotnet).
 
+- [Querying with LINQ and `IQueryable`](./IQUERYABLE.md)
+- [Graph traversals with LINQ and `IQueryable`](./GRAPH_QUERIES.md)
+
 ## Features
 
 - HTTP and WebSocket connections
@@ -48,6 +51,7 @@ View the SDK documentation [here](https://surrealdb.com/docs/integration/librari
 - Authentication
 - Live queries
 - Client-side transactions
+- LINQ queries, including typed graph traversals
 
 ## How to install
 
