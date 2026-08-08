@@ -87,7 +87,8 @@ The direction is relative to the current node:
 - `In<TEdge, TNode>()` translates to `<-edge<-node`.
 - `Both<TEdge, TNode>()` translates to `<->edge<->node`.
 
-The explicit `Out<TEdge, TNode>()` and `In<TEdge, TNode>()` overloads can be used without typed endpoint properties. In that case, the generic types are the source of the relation and endpoint table names, so make sure they match the SurrealDB relation schema and direction.
+The explicit `Out<TEdge, TNode>()` and `In<TEdge, TNode>()` overloads can be used without typed endpoint properties. In that case, the generic types are the source of the relation and endpoint table names, so make sure they match the SurrealDB relation schema and direction. 
+When `TEdge` declares `[SurrealIn]` and `[SurrealOut]` properties, the provider validates the selected direction, source table, and explicit `TNode` before generating SurrealQL.
 
 ## Work with edge and node fields together
 
@@ -175,7 +176,17 @@ var query = client.Select<User>().Select(user =>
 
 Both endpoint properties are required for `Both`, and they must use the same CLR type. Use `Both<TEdge>()` only to filter or project fields on the symmetric relation record itself.
 
-Avoid `GraphStep<TEdge, TNode>` edge-and-node lambdas with `Both` for now. A bidirectional edge has no single fixed `in` or `out` property that always represents the other endpoint; project nodes and edge fields separately, or use an explicit SurrealQL query when both are required together.
+In a `GraphStep<TEdge, TNode>` lambda, `step.Node` always means the endpoint opposite the current source node. For `Both`, the provider therefore generates a conditional endpoint expression equivalent to `IF in == $parent.id THEN out ELSE in END`. This lets a single projection safely combine symmetric edge and neighbor fields:
+
+```csharp
+var query = client.Select<User>().SelectMany(user =>
+    user.Both<Friends, User>().Select(step => new
+    {
+        EdgeId = step.Edge.Id,
+        FriendName = step.Node.Name
+    })
+);
+```
 
 ## Supported LINQ operations
 

@@ -31,6 +31,7 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
     private readonly SemVersion _surrealVersion;
 
     private int _currentNestedSelectLevel = 0;
+    private string? _currentSourceTable;
     private readonly Dictionary<ParameterExpression, int> _parametersNestedLevels = [];
 
     public SurrealExpressionVisitor(
@@ -102,13 +103,31 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
 
     private SelectStatementExpression BindSelect(SelectExpression selectExpression)
     {
-        var fields = (FieldsExpression)Visit(selectExpression.Projection)!;
-        var what = (WhatExpression)Visit(selectExpression.Source)!;
-        var cond = (ConditionsExpression?)Visit(selectExpression.Where);
-        var grouping = (GroupingExpression?)Visit(selectExpression.Groups);
-        var ordering = (OrderingExpression?)Visit(selectExpression.Orders);
-        var limit = (LimitExpression?)Visit(selectExpression.Take);
-        var start = (StartExpression?)Visit(selectExpression.Skip);
+        string? previousSourceTable = _currentSourceTable;
+        _currentSourceTable = TryGetSourceTable(selectExpression.Source);
+
+        FieldsExpression fields;
+        WhatExpression what;
+        ConditionsExpression? cond;
+        GroupingExpression? grouping;
+        OrderingExpression? ordering;
+        LimitExpression? limit;
+        StartExpression? start;
+        try
+        {
+            fields = (FieldsExpression)Visit(selectExpression.Projection)!;
+            what = (WhatExpression)Visit(selectExpression.Source)!;
+            cond = (ConditionsExpression?)Visit(selectExpression.Where);
+            grouping = (GroupingExpression?)Visit(selectExpression.Groups);
+            ordering = (OrderingExpression?)Visit(selectExpression.Orders);
+            limit = (LimitExpression?)Visit(selectExpression.Take);
+            start = (StartExpression?)Visit(selectExpression.Skip);
+        }
+        finally
+        {
+            _currentSourceTable = previousSourceTable;
+        }
+
         var explain = selectExpression.Explain.HasValue
             ? new ExplainExpression(selectExpression.Explain.Value)
             : null;
@@ -174,6 +193,14 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
             explain
         );
     }
+
+    private static string? TryGetSourceTable(SourceExpression sourceExpression) =>
+        sourceExpression switch
+        {
+            TableSourceExpression tableSource => tableSource.Table.TableName,
+            SelectSourceExpression selectSource => TryGetSourceTable(selectSource.Select.Source),
+            _ => null,
+        };
 
     private FieldsExpression BindFields(ProjectionExpression projectionExpression)
     {
@@ -993,6 +1020,13 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
                         ?? throw new NotSupportedException(
                             "Graph node projections can only be applied directly after a graph traversal step."
                         );
+                    if (graphPart.Direction == GraphDirection.Both)
+                    {
+                        return new BidirectionalGraphEndpointValueExpression(
+                            new IdiomExpression([new FieldPartExpression("in")]),
+                            new IdiomExpression([new FieldPartExpression("out")])
+                        );
+                    }
                     string endpointField = graphPart.Direction == GraphDirection.Out ? "out" : "in";
                     return new IdiomExpression([new FieldPartExpression(endpointField)]);
                 }
@@ -1037,7 +1071,8 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
                             new FieldPartExpression(fieldName)
                         ),
                         graphTraversalValueExpression.FlattenDepth,
-                        graphTraversalValueExpression.RequiresProjection
+                        graphTraversalValueExpression.RequiresProjection,
+                        graphTraversalValueExpression.CurrentNodeType
                     );
                 }
 
@@ -1120,7 +1155,8 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
                     new FieldPartExpression(fieldName)
                 ),
                 sourceGraphTraversalValueExpression.FlattenDepth,
-                sourceGraphTraversalValueExpression.RequiresProjection
+                sourceGraphTraversalValueExpression.RequiresProjection,
+                sourceGraphTraversalValueExpression.CurrentNodeType
             );
         }
 
@@ -1142,6 +1178,16 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
                     edgeIdiomValueExpression.Idiom,
                     new FieldPartExpression(fieldName)
                 )
+            );
+        }
+
+        if (
+            source
+            is BidirectionalGraphEndpointValueExpression bidirectionalGraphEndpointValueExpression
+        )
+        {
+            return bidirectionalGraphEndpointValueExpression.Append(
+                new FieldPartExpression(fieldName)
             );
         }
 
@@ -2029,30 +2075,39 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
         var genericArguments = node.Method.GetGenericArguments();
         var edgeType = genericArguments[0];
         var edgeTable = GetTableName(edgeType);
-        Type nodeType;
-        if (direction == GraphDirection.Both)
+        GraphEdgeMetadata? edgeMetadata = null;
+        if (direction == GraphDirection.Both || genericArguments.Length == 1)
         {
-            var endpointType = GraphEdgeMetadataResolver
-                .Get(edgeType)
-                .GetEndpointProperty(direction)
-                .PropertyType;
-            nodeType = genericArguments.Length == 2 ? genericArguments[1] : endpointType;
-            if (nodeType != endpointType)
-            {
-                throw new NotSupportedException(
-                    $"Bidirectional traversal of edge type '{edgeType.Name}' must use endpoint type '{endpointType.Name}'."
-                );
-            }
+            edgeMetadata = GraphEdgeMetadataResolver.Get(edgeType);
         }
         else
         {
-            nodeType =
-                genericArguments.Length == 2
-                    ? genericArguments[1]
-                    : GraphEdgeMetadataResolver
-                        .Get(edgeType)
-                        .GetEndpointProperty(direction)
-                        .PropertyType;
+            GraphEdgeMetadataResolver.TryGet(edgeType, out edgeMetadata);
+        }
+
+        Type nodeType =
+            genericArguments.Length == 2
+                ? genericArguments[1]
+                : edgeMetadata!.GetEndpointProperty(direction).PropertyType;
+        if (edgeMetadata is not null)
+        {
+            Type? sourceNodeType = sourceValue switch
+            {
+                GraphTraversalValueExpression graphTraversal => graphTraversal.CurrentNodeType,
+                _ => TryGetRecordType(node.Arguments[0]),
+            };
+            string? sourceNodeTable =
+                sourceValue is GraphTraversalValueExpression
+                    ? GetTableName(sourceNodeType!)
+                    : _currentSourceTable;
+            ValidateGraphTraversalTypes(
+                edgeType,
+                edgeMetadata,
+                direction,
+                sourceNodeType,
+                sourceNodeTable,
+                nodeType
+            );
         }
         var nodeTable = GetTableName(nodeType);
         int flattenDepth =
@@ -2066,8 +2121,66 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
                 new GraphPartExpression(direction, edgeTable, nodeTable)
             ),
             flattenDepth,
-            requiresProjection: genericArguments.Length == 1
+            requiresProjection: genericArguments.Length == 1,
+            currentNodeType: nodeType
         );
+    }
+
+    private static void ValidateGraphTraversalTypes(
+        Type edgeType,
+        GraphEdgeMetadata edgeMetadata,
+        GraphDirection direction,
+        Type? sourceNodeType,
+        string? sourceNodeTable,
+        Type nodeType
+    )
+    {
+        Type endpointType = edgeMetadata.GetEndpointProperty(direction).PropertyType;
+        string directionName = direction switch
+        {
+            GraphDirection.Out => "Outgoing",
+            GraphDirection.In => "Incoming",
+            GraphDirection.Both => "Bidirectional",
+            _ => throw new ArgumentOutOfRangeException(nameof(direction)),
+        };
+
+        if (nodeType != endpointType)
+        {
+            throw new NotSupportedException(
+                $"{directionName} traversal of edge type '{edgeType.Name}' must use endpoint type '{endpointType.Name}'."
+            );
+        }
+
+        Type expectedSourceType = direction switch
+        {
+            GraphDirection.Out => edgeMetadata.InProperty.PropertyType,
+            GraphDirection.In => edgeMetadata.OutProperty.PropertyType,
+            GraphDirection.Both => endpointType,
+            _ => throw new ArgumentOutOfRangeException(nameof(direction)),
+        };
+        if (
+            sourceNodeTable is not null
+            && !sourceNodeTable.Equals(GetTableName(expectedSourceType), StringComparison.Ordinal)
+        )
+        {
+            string actualSource = sourceNodeType?.Name ?? sourceNodeTable;
+            throw new NotSupportedException(
+                $"{directionName} traversal of edge type '{edgeType.Name}' must start from node type '{expectedSourceType.Name}', but the source node type is '{actualSource}'."
+            );
+        }
+    }
+
+    private static Type? TryGetRecordType(Expression expression)
+    {
+        while (expression is UnaryExpression { NodeType: ExpressionType.Convert } conversion)
+        {
+            expression = conversion.Operand;
+        }
+
+        return
+            typeof(IRecord).IsAssignableFrom(expression.Type) && expression.Type != typeof(IRecord)
+            ? expression.Type
+            : null;
     }
 
     private ValueExpression BindGraphWhereMethodCall(MethodCallExpression node)
@@ -2120,7 +2233,8 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
         return new GraphTraversalValueExpression(
             IdiomExpression.Chain(graphTraversal.Idiom, new WherePartExpression(predicateValue)),
             graphTraversal.FlattenDepth,
-            graphTraversal.RequiresProjection
+            graphTraversal.RequiresProjection,
+            graphTraversal.CurrentNodeType
         );
     }
 
@@ -2161,7 +2275,8 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
             return new GraphTraversalValueExpression(
                 IdiomExpression.Chain(edgeTraversal.Idiom, new ObjectPartExpression(objectValue)),
                 edgeTraversal.FlattenDepth,
-                requiresProjection: false
+                requiresProjection: false,
+                currentNodeType: edgeTraversal.CurrentNodeType
             );
         }
 
@@ -2183,7 +2298,8 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
             return new GraphTraversalValueExpression(
                 new IdiomExpression([.. edgeTraversal.Idiom.Parts, .. edgeIdiom.Idiom.Parts]),
                 edgeTraversal.FlattenDepth,
-                requiresProjection: false
+                requiresProjection: false,
+                currentNodeType: edgeTraversal.CurrentNodeType
             );
         }
 
@@ -4869,7 +4985,8 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
                 [.. parts.RemoveAt(parts.Length - 1), graphPart.WithEdgeWhere(combinedEdgeWhere)]
             ),
             graphTraversal.FlattenDepth,
-            graphTraversal.RequiresProjection
+            graphTraversal.RequiresProjection,
+            graphTraversal.CurrentNodeType
         );
     }
 
@@ -4897,7 +5014,8 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
                 ]
             ),
             graphTraversal.FlattenDepth,
-            graphTraversal.RequiresProjection
+            graphTraversal.RequiresProjection,
+            graphTraversal.CurrentNodeType
         );
     }
 
@@ -4924,7 +5042,8 @@ internal sealed class SurrealExpressionVisitor : ExpressionVisitor
         projection = new GraphTraversalValueExpression(
             new IdiomExpression([.. graphTraversal.Idiom.Parts, .. remaining]),
             graphTraversal.FlattenDepth,
-            requiresProjection: false
+            requiresProjection: false,
+            currentNodeType: graphTraversal.CurrentNodeType
         );
         return true;
     }

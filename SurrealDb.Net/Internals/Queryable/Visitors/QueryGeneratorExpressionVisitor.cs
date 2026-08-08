@@ -452,6 +452,13 @@ internal sealed class QueryGeneratorExpressionVisitor : ExpressionVisitor
             Visit(edgeIdiomExpression.Idiom);
         }
 
+        if (valueExpression is BidirectionalGraphEndpointValueExpression bidirectionalGraphEndpoint)
+        {
+            _surqlQueryBuilder.Append('(');
+            Visit(bidirectionalGraphEndpoint.ToConditionalExpression());
+            _surqlQueryBuilder.Append(')');
+        }
+
         if (valueExpression is DelayedFlattenValueExpression delayedFlattenExpression)
         {
             VisitFlattenedValue(

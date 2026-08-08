@@ -109,6 +109,42 @@ public class ComplexQueryableTests : BaseQueryableTests
 
     [Test]
     [WebsocketConnectionStringFixtureGenerator]
+    public async Task ShouldSelectBidirectionalEdgesWithOtherEndpoints(string connectionString)
+    {
+        var (result, query) = await ExecuteWithSchemaAsync(
+            connectionString,
+            SurrealSchemaFile.Store,
+            client =>
+                client
+                    .Select<StoreUser>()
+                    .Where(user => user.Name == "Bob Buyer")
+                    .SelectMany(user =>
+                        user.Both<Friends, StoreUser>()
+                            .Select(step => new
+                            {
+                                EdgeId = step.Edge.Id,
+                                FriendName = step.Node.Name,
+                            })
+                    )
+                    .OrderBy(friendship => friendship.FriendName)
+        );
+        query
+            .Should()
+            .Be(
+                """
+                SELECT EdgeId, FriendName FROM array::flatten((SELECT VALUE $this<->friends.{ EdgeId: id, FriendName: (IF in == $parent.id THEN out.name ELSE in.name END) } FROM user WHERE name == "Bob Buyer")) ORDER BY FriendName
+                """
+            );
+
+        result
+            .Select(friendship => friendship.FriendName)
+            .Should()
+            .Equal("Alice Example", "Charlie Client", "Diana Designer");
+        result.Select(friendship => friendship.EdgeId).Should().OnlyHaveUniqueItems();
+    }
+
+    [Test]
+    [WebsocketConnectionStringFixtureGenerator]
     public async Task ShouldSelectGroupOfPurchasedMoreThanOnce(string connectionString)
     {
         var (result, query) = await ExecuteWithSchemaAsync(

@@ -898,16 +898,19 @@ internal sealed class GraphTraversalValueExpression : ValueExpression
     public IdiomExpression Idiom { get; }
     public int FlattenDepth { get; }
     public bool RequiresProjection { get; }
+    public Type CurrentNodeType { get; }
 
     public GraphTraversalValueExpression(
         IdiomExpression idiom,
         int flattenDepth,
-        bool requiresProjection
+        bool requiresProjection,
+        Type currentNodeType
     )
     {
         Idiom = idiom;
         FlattenDepth = flattenDepth;
         RequiresProjection = requiresProjection;
+        CurrentNodeType = currentNodeType;
     }
 }
 
@@ -929,6 +932,50 @@ internal sealed class GraphEndpointIdiomValueExpression : EdgeIdiomValueExpressi
         : base(idiom)
     {
         Direction = direction;
+    }
+}
+
+internal sealed class BidirectionalGraphEndpointValueExpression : ValueExpression
+{
+    public IdiomExpression InIdiom { get; }
+    public IdiomExpression OutIdiom { get; }
+
+    public BidirectionalGraphEndpointValueExpression(
+        IdiomExpression inIdiom,
+        IdiomExpression outIdiom
+    )
+    {
+        InIdiom = inIdiom;
+        OutIdiom = outIdiom;
+    }
+
+    public BidirectionalGraphEndpointValueExpression Append(FieldPartExpression field)
+    {
+        return new BidirectionalGraphEndpointValueExpression(
+            IdiomExpression.Chain(InIdiom, field),
+            IdiomExpression.Chain(OutIdiom, field)
+        );
+    }
+
+    public ValueExpression ToConditionalExpression()
+    {
+        var inEndpoint = new IdiomValueExpression(InIdiom);
+        var outEndpoint = new IdiomValueExpression(OutIdiom);
+        var parentId = new IdiomValueExpression(
+            new IdiomExpression(
+                [
+                    new StartPartExpression(new ParameterValueExpression("parent")),
+                    new FieldPartExpression("id"),
+                ]
+            )
+        );
+        var sourceIsInEndpoint = new BinaryValueExpression(
+            new IdiomValueExpression(new IdiomExpression([new FieldPartExpression("in")])),
+            new SimpleOperator(OperatorType.Exact),
+            parentId
+        );
+
+        return new IfElseStatementValueExpression((sourceIsInEndpoint, outEndpoint), inEndpoint);
     }
 }
 

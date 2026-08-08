@@ -132,6 +132,39 @@ public class GraphQueryableTests : BaseQueryableTests
     }
 
     [Test]
+    public void ShouldProjectBidirectionalTraversalEdgeAndOtherEndpoint()
+    {
+        string query = ToSurql(
+            Users.Select(user =>
+                user.Both<Friends, StoreUser>()
+                    .Select(step => new { EdgeId = step.Edge.Id, FriendName = step.Node.Name })
+            )
+        );
+
+        query
+            .Should()
+            .Be(
+                "SELECT VALUE $this<->friends.{ EdgeId: id, FriendName: (IF in == $parent.id THEN out.name ELSE in.name END) } FROM user"
+            );
+    }
+
+    [Test]
+    public void ShouldFilterBidirectionalTraversalByOtherEndpoint()
+    {
+        string query = ToSurql(
+            Users.Select(user =>
+                user.Both<Friends, StoreUser>().Where(step => step.Node.Name == "Alice Example")
+            )
+        );
+
+        query
+            .Should()
+            .Be(
+                "SELECT VALUE $this<->(friends WHERE (IF in == $parent.id THEN out.name ELSE in.name END) == \"Alice Example\")<->user FROM user"
+            );
+    }
+
+    [Test]
     public void ShouldProjectBidirectionalTraversalEdgeField()
     {
         string query = ToSurql(
@@ -193,6 +226,41 @@ public class GraphQueryableTests : BaseQueryableTests
             .Should()
             .Throw<NotSupportedException>()
             .WithMessage("*must use endpoint type 'StoreUser'*");
+    }
+
+    [Test]
+    public void ShouldRejectOutgoingTraversalWithWrongExplicitEndpointType()
+    {
+        Action action = () => ToSurql(Users.Select(user => user.Out<Purchased, StoreUser>()));
+
+        action
+            .Should()
+            .Throw<NotSupportedException>()
+            .WithMessage("*Outgoing traversal*must use endpoint type 'StoreProduct'*");
+    }
+
+    [Test]
+    public void ShouldRejectIncomingTraversalWithWrongExplicitEndpointType()
+    {
+        Action action = () =>
+            ToSurql(Products.Select(product => product.In<Purchased, StoreProduct>()));
+
+        action
+            .Should()
+            .Throw<NotSupportedException>()
+            .WithMessage("*Incoming traversal*must use endpoint type 'StoreUser'*");
+    }
+
+    [Test]
+    public void ShouldRejectTraversalWithWrongSourceNodeType()
+    {
+        Action action = () =>
+            ToSurql(Products.Select(product => product.Out<Purchased, StoreProduct>()));
+
+        action
+            .Should()
+            .Throw<NotSupportedException>()
+            .WithMessage("*Outgoing traversal*must start from node type 'StoreUser'*");
     }
 
     [Test]

@@ -60,12 +60,31 @@ internal sealed class GraphEdgeMetadata
 internal static class GraphEdgeMetadataResolver
 {
     private static readonly ConcurrentDictionary<Type, GraphEdgeMetadata> MetadataCache = new();
+    private static readonly ConcurrentDictionary<Type, bool> HasMetadataCache = new();
     private static readonly ConcurrentDictionary<PropertyInfo, bool> NavigationPropertyCache =
         new();
 
     public static GraphEdgeMetadata Get(Type edgeType)
     {
         return MetadataCache.GetOrAdd(edgeType, Create);
+    }
+
+    public static bool TryGet(Type edgeType, out GraphEdgeMetadata? metadata)
+    {
+        bool hasMetadata = HasMetadataCache.GetOrAdd(
+            edgeType,
+            static type =>
+                type.GetProperties(BindingFlags.Instance | BindingFlags.Public)
+                    .Any(IsNavigationProperty)
+        );
+        if (!hasMetadata)
+        {
+            metadata = null;
+            return false;
+        }
+
+        metadata = Get(edgeType);
+        return true;
     }
 
     public static bool IsNavigationProperty(PropertyInfo property)

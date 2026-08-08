@@ -436,6 +436,10 @@ internal sealed class ApproximateQueryLengthExpressionVisitor : ExpressionVisito
             case EdgeIdiomValueExpression edgeIdiom:
                 Visit(edgeIdiom.Idiom);
                 break;
+            case BidirectionalGraphEndpointValueExpression bidirectionalGraphEndpoint:
+                _length += 2; // "()"
+                Visit(bidirectionalGraphEndpoint.ToConditionalExpression());
+                break;
             case DelayedFlattenValueExpression delayedFlatten:
                 _length += delayedFlatten.FlattenDepth * "array::flatten()".Length;
                 Visit(delayedFlatten.Value);
