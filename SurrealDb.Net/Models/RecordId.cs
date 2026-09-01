@@ -129,8 +129,12 @@ public partial class RecordId : IEquatable<RecordId>
         var hashCode = new HashCode();
         hashCode.Add(Table, StringComparer.Ordinal);
 
+#if NET8_0_OR_GREATER
+        hashCode.AddBytes(GetSerializedId().Span);
+#else
         foreach (byte value in GetSerializedId().Span)
             hashCode.Add(value);
+#endif
 
         return hashCode.ToHashCode();
     }
