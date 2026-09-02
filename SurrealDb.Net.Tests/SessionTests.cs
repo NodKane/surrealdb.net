@@ -121,9 +121,8 @@ public class SessionTests
         result.SessionId.Should().NotBeNull();
         result.SessionId!.Value.Should().NotBe(firstSession.SessionId!.Value);
 
-        var response = await result.RawQuery("RETURN <string>encoding::json::encode($session);");
-
-        response.GetValue<string>(0).Should().NotBeNullOrEmpty();
+        // INFO FOR DB requires both the selected database and root authentication.
+        (await result.RawQuery("INFO FOR DB;")).EnsureAllOks();
 
         await firstSession.DisposeAsync();
     }
